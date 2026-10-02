@@ -29,14 +29,17 @@
  *     reachability to it (the same reachability pvewhmcs.php already
  *     needs for provisioning).
  *   - PVEAuthCookie never reaches the browser: this process presents it
- *     to Proxmox itself, on the outbound connection.
+ *     to Proxmox itself, on the outbound connection, and v2 tokens carry
+ *     it encrypted (AES-256-GCM), so the browser cannot read it either.
  *   - The browser only ever talks to the WHMCS domain, so there is no
  *     PTR, same-registrable-domain, or cross-domain cookie requirement.
  *
- * pvewhmcs.php mints a short-lived, HMAC-signed, single-use token
- * (see pvewhmcs_build_console_token() in proxmox.php) describing the
- * upstream Proxmox target. This relay verifies that token, connects
- * upstream, and pipes frames both ways until either side closes.
+ * pvewhmcs.php mints a short-lived, single-use token (see
+ * pvewhmcs_build_console_token() in proxmox.php) describing the upstream
+ * Proxmox target. This relay verifies that token, connects upstream, and
+ * pipes frames both ways until either side closes. The token's "exp" only
+ * bounds the browser attach window; an attached session lives up to
+ * maxSessionSeconds.
  */
 
 const crypto = require('crypto');
@@ -70,13 +73,45 @@ function base64UrlDecode(input) {
     return Buffer.from(normalized, 'base64');
 }
 
+const TOKEN_V2_PREFIX = 'v2.';
+const TOKEN_V2_CONTEXT = 'pvewhmcs-console-token-v2';
+const TOKEN_V2_IV_BYTES = 12;
+const TOKEN_V2_TAG_BYTES = 16;
+
 /**
- * Verifies token structure/signature/expiry only. Single-use replay
- * protection happens in the caller, which tracks the "sid" once the
- * signature is confirmed valid.
+ * v2: "v2." + base64url(iv | AES-256-GCM ciphertext | tag), key =
+ * SHA-256(TOKEN_V2_CONTEXT + "|" + secret), AAD = TOKEN_V2_CONTEXT.
+ * Must stay byte-compatible with pvewhmcs_build_console_token().
  */
-function verifyToken(token, secret) {
-    if (typeof token !== 'string' || token.indexOf('.') === -1) {
+function decodeTokenV2(token, secret) {
+    const raw = base64UrlDecode(token.slice(TOKEN_V2_PREFIX.length));
+    if (raw.length <= TOKEN_V2_IV_BYTES + TOKEN_V2_TAG_BYTES) {
+        throw new Error('malformed token');
+    }
+    const iv = raw.subarray(0, TOKEN_V2_IV_BYTES);
+    const tag = raw.subarray(raw.length - TOKEN_V2_TAG_BYTES);
+    const ciphertext = raw.subarray(TOKEN_V2_IV_BYTES, raw.length - TOKEN_V2_TAG_BYTES);
+    const key = crypto.createHash('sha256').update(TOKEN_V2_CONTEXT + '|' + secret).digest();
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAAD(Buffer.from(TOKEN_V2_CONTEXT, 'utf8'));
+    decipher.setAuthTag(tag);
+    let plaintext;
+    try {
+        plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    } catch (err) {
+        throw new Error('signature mismatch');
+    }
+
+    return JSON.parse(plaintext.toString('utf8'));
+}
+
+/**
+ * v1 (legacy, readable by the browser): base64url(json) + "." + hex HMAC-SHA256.
+ * Still accepted so a relay upgrade never breaks consoles minted by an
+ * older WHMCS module.
+ */
+function decodeTokenV1(token, secret) {
+    if (token.indexOf('.') === -1) {
         throw new Error('malformed token');
     }
 
@@ -91,7 +126,25 @@ function verifyToken(token, secret) {
         throw new Error('signature mismatch');
     }
 
-    const payload = JSON.parse(base64UrlDecode(encoded).toString('utf8'));
+    return JSON.parse(base64UrlDecode(encoded).toString('utf8'));
+}
+
+/**
+ * Verifies token structure/authenticity/expiry only. Single-use replay
+ * protection happens in the caller, which tracks the "sid" once the
+ * token is confirmed authentic.
+ */
+function verifyToken(token, secret) {
+    if (typeof token !== 'string' || token === '') {
+        throw new Error('malformed token');
+    }
+
+    const payload = token.startsWith(TOKEN_V2_PREFIX)
+        ? decodeTokenV2(token, secret)
+        : decodeTokenV1(token, secret);
+    if (!payload || typeof payload !== 'object') {
+        throw new Error('malformed token');
+    }
     if (typeof payload.exp !== 'number' || payload.exp < Math.floor(Date.now() / 1000)) {
         throw new Error('token expired');
     }
@@ -108,7 +161,9 @@ function createSessionRegistry() {
     setInterval(() => {
         const now = Math.floor(Date.now() / 1000);
         for (const [sid, session] of sessions) {
-            if (session.expiresAt < now) {
+            // A closed session is kept until its token expires so the same
+            // sid cannot be replayed; after that it is safe to forget.
+            if (session.expiresAt < now || (session.closed && session.payload.exp < now)) {
                 sessions.delete(sid);
             }
         }
@@ -134,7 +189,6 @@ function createRelay(config) {
         const prepareSuffix = '/prepare';
         const isPrepareRequest = requestPath.indexOf(preparePrefix) === 0
             && requestPath.endsWith(prepareSuffix);
-        const origin = req.headers.origin;
 
         if (requestPath === '/healthz' && req.method === 'GET') {
             res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -143,31 +197,20 @@ function createRelay(config) {
             return;
         }
 
-        if (isPrepareRequest && (req.method === 'OPTIONS' || req.method === 'POST')) {
+        // Only pvewhmcs.php calls /prepare, server-side, so no CORS headers:
+        // a browser on another origin must not be able to read the reply.
+        if (isPrepareRequest && req.method === 'POST') {
             const token = requestPath.slice(preparePrefix.length, -prepareSuffix.length);
-            const corsHeaders = {
-                'Access-Control-Allow-Methods': 'POST, OPTIONS',
-                'Access-Control-Allow-Headers': 'Content-Type, X-Requested-With',
+            const prepareHeaders = {
                 'Cache-Control': 'no-store',
             };
-            if (origin) {
-                corsHeaders['Access-Control-Allow-Origin'] = origin;
-                corsHeaders.Vary = 'Origin';
-            }
-
-            if (req.method === 'OPTIONS') {
-                res.writeHead(204, corsHeaders);
-                res.end();
-
-                return;
-            }
 
             let payload;
             try {
                 payload = verifyToken(token, config.secret);
             } catch (err) {
                 log('reject', { reason: err.message });
-                res.writeHead(401, Object.assign({}, corsHeaders, { 'Content-Type': 'application/json' }));
+                res.writeHead(401, Object.assign({}, prepareHeaders, { 'Content-Type': 'application/json' }));
                 res.end(JSON.stringify({ ready: false, error: 'unauthorized' }));
 
                 return;
@@ -176,7 +219,7 @@ function createRelay(config) {
             req.resume();
             const session = getOrCreateSession(payload);
             if (session.closed) {
-                res.writeHead(409, Object.assign({}, corsHeaders, {
+                res.writeHead(409, Object.assign({}, prepareHeaders, {
                     'Content-Type': 'application/json',
                 }));
                 res.end(JSON.stringify({ ready: false, error: 'session already used' }));
@@ -192,7 +235,7 @@ function createRelay(config) {
             // would tie this response's latency to Proxmox reachability
             // and defeat the purpose of preconnecting early.
             log('prewarm', { sid: payload.sid, host: payload.host });
-            res.writeHead(200, Object.assign({}, corsHeaders, {
+            res.writeHead(200, Object.assign({}, prepareHeaders, {
                 'Content-Type': 'application/json',
             }));
             res.end(JSON.stringify({ ready: true }));
@@ -214,6 +257,7 @@ function createRelay(config) {
         }
         session.closed = true;
         clearTimeout(session.sessionTimer);
+        clearTimeout(session.attachTimer);
         try { if (session.clientWs) session.clientWs.close(clientCode, reason); } catch (e) { /* already closed */ }
         try { if (session.upstream) session.upstream.close(); } catch (e) { /* already closed */ }
     };
@@ -315,17 +359,27 @@ function createRelay(config) {
             toUpstream: [],
             fromUpstream: [],
             fromUpstreamBytes: 0,
-            expiresAt: Math.min(
-                now + config.maxSessionSeconds,
-                payload.exp
-            ),
+            // Session lifetime, independent of the token's short attach
+            // window; never shorter than the token so the sid stays
+            // registered (single-use) for as long as the token is valid.
+            expiresAt: Math.max(now + config.maxSessionSeconds, payload.exp),
             sessionTimer: null,
+            attachTimer: null,
         };
         session.sessionTimer = setTimeout(() => {
             log('session-timeout', { sid: payload.sid });
             closeSession(session, 4408, 'session timeout');
-        }, Math.max(1000, (session.expiresAt - now) * 1000));
+        }, Math.max(1000, config.maxSessionSeconds * 1000));
         session.sessionTimer.unref();
+        // A prewarmed upstream whose browser never attaches is released
+        // when the token expires.
+        session.attachTimer = setTimeout(() => {
+            if (!session.clientWs) {
+                log('attach-timeout', { sid: payload.sid });
+                closeSession(session, 4408, 'attach timeout');
+            }
+        }, Math.max(1000, (payload.exp - now) * 1000));
+        session.attachTimer.unref();
         sessions.set(payload.sid, session);
         session.readyPromise = createUpstream(session);
         session.readyPromise.catch(() => {});
@@ -370,6 +424,7 @@ function createRelay(config) {
             return;
         }
         session.clientWs = clientWs;
+        clearTimeout(session.attachTimer);
         for (const buffered of session.fromUpstream.splice(0)) {
             clientWs.send(buffered);
         }
@@ -414,4 +469,4 @@ if (require.main === module) {
     });
 }
 
-module.exports = { loadConfig, verifyToken, base64UrlDecode, createRelay, createSessionRegistry };
+module.exports = { loadConfig, verifyToken, decodeTokenV1, decodeTokenV2, base64UrlDecode, createRelay, createSessionRegistry };

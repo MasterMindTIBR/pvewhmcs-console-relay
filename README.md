@@ -34,10 +34,18 @@ Subdomain:    Browser --wss--> vnc.example.com (443) -----------reverse proxy /-
 ```
 
 `pvewhmcs_noVNC()` first asks the relay to open the Proxmox WebSocket and wait
-for the browser. It then hands the already-connected session to noVNC. This
+for the browser (`POST <pathPrefix>/<token>/prepare`, sent server-to-server
+by WHMCS; the relay sends no CORS headers, so a browser on another origin
+cannot use it). It then hands the already-connected session to noVNC. This
 prewarm/handoff is intentional: the Proxmox VNC proxy has a short attachment
 timeout, while a browser may still be loading a slow tab or noVNC assets.
-The relay verifies the same short-lived, HMAC-signed token for both requests.
+The relay verifies the same short-lived, single-use token for both requests.
+
+Current WHMCS modules mint **v2** tokens: the payload (Proxmox host, port,
+path and the `vnc@pve` ticket) is encrypted with AES-256-GCM under a key
+derived from the shared `secret`, so the browser holding the URL cannot read
+it. The relay still accepts legacy **v1** tokens (HMAC-signed, readable) from
+older module versions.
 
 If you deploy the relay on its own subdomain, set that subdomain in WHMCS
 under **Addons > Proxmox VE for WHMCS > Config > Console Relay Host** (and
@@ -164,8 +172,11 @@ Adjust the port in any of the above to match `listenPort` in `config.json`.
 - Rotate `secret` by updating it in both places (WHMCS Module Config and
   `config.json`) — old, in-flight tokens simply stop validating.
 - The relay never touches the WHMCS database or PVE credentials beyond what
-  each token carries. The signed token is held only until the browser handoff
-  completes and expires after five minutes.
+  each token carries. A token only authorizes attaching to its session
+  during its short lifetime (120 s, set by the WHMCS module); a prewarmed
+  session that no browser attaches to in that window is closed. Once a viewer
+  is attached, the session lasts until either side closes or
+  `maxSessionSeconds` (default 7200) elapses. Each token's `sid` works once.
 - Keep `listenPort` bound to `127.0.0.1` (already the default) so it is only
   reachable through the reverse proxy, never directly from the Internet.
 
