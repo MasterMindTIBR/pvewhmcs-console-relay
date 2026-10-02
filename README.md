@@ -1,6 +1,6 @@
 # pvewhmcs-console-relay
 
-Console Relay for [Proxmox VE for WHMCS](https://github.com/junglivre/Proxmox-VE-for-WHMCS).
+Console Relay for [Proxmox VE for WHMCS](https://github.com/MasterMindTIBR/Proxmox-VE-for-WHMCS).
 
 Bridges a browser's noVNC WebSocket to Proxmox's `vncwebsocket` API endpoint,
 so Proxmox never needs a public IP, a PTR record, or to share a registrable
@@ -9,7 +9,7 @@ reachability to Proxmox on port 8006 — the same reachability the WHMCS
 module already needs for provisioning.
 
 This relay is deployed alongside the WHMCS module; see that project's
-[README "noVNC" section](https://github.com/junglivre/Proxmox-VE-for-WHMCS#-2-novnc-console-tunnel-client-area)
+[README "noVNC" section](https://github.com/MasterMindTIBR/Proxmox-VE-for-WHMCS#-2-novnc-console-tunnel-client-area)
 for the WHMCS-side setup (restricted `vnc@pve` user, Module Config fields).
 
 ## Run this standalone — it's a long-lived WebSocket server
@@ -47,7 +47,7 @@ to keep sharing the WHMCS domain instead.
 ## 1. Deploy the relay
 
 ```bash
-git clone https://github.com/junglivre/pvewhmcs-console-relay.git /opt/pvewhmcs-console-relay
+git clone https://github.com/MasterMindTIBR/pvewhmcs-console-relay.git /opt/pvewhmcs-console-relay
 cd /opt/pvewhmcs-console-relay
 cp config.example.json config.json
 # edit config.json: set "secret" to the same value as WHMCS's Module Config

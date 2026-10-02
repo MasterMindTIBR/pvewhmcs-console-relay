@@ -3,7 +3,7 @@
 /*
     pvewhmcs-console-relay
     Console Relay for Proxmox VE for WHMCS
-    https://github.com/junglivre/pvewhmcs-console-relay
+    https://github.com/MasterMindTIBR/pvewhmcs-console-relay
     File: server.js
 
     Copyright (C) junglivre
