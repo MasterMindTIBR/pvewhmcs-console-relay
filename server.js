@@ -73,6 +73,13 @@ function base64UrlDecode(input) {
     return Buffer.from(normalized, 'base64');
 }
 
+// IPv6 literals must be bracketed inside a URL authority.
+function urlHost(host) {
+    const value = String(host);
+
+    return value.includes(':') && !value.startsWith('[') ? `[${value}]` : value;
+}
+
 const TOKEN_V2_PREFIX = 'v2.';
 const TOKEN_V2_CONTEXT = 'pvewhmcs-console-token-v2';
 const TOKEN_V2_IV_BYTES = 12;
@@ -264,8 +271,8 @@ function createRelay(config) {
 
     const createUpstream = (session) => new Promise((resolve, reject) => {
         const payload = session.payload;
-        const upstreamUrl = `wss://${payload.host}:${payload.port || 8006}/${payload.path}`;
-        const upstreamOrigin = `https://${payload.host}:${payload.port || 8006}`;
+        const upstreamUrl = `wss://${urlHost(payload.host)}:${payload.port || 8006}/${payload.path}`;
+        const upstreamOrigin = `https://${urlHost(payload.host)}:${payload.port || 8006}`;
         const upstream = new WebSocket(upstreamUrl, {
             headers: {
                 Cookie: 'PVEAuthCookie=' + payload.cookie,
