@@ -102,6 +102,16 @@ function viewer(relayPort, token, send) {
     });
     assert.strictEqual(r5, 1011);
 
+    // 6. Zero-length frames count against the queue too (entry cap).
+    const r6 = await new Promise((resolve) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${pCa}/pve-console-ws/${tokenV2(payload())}`);
+        ws.on('open', () => { for (let i = 0; i < 2000; i++) ws.send(Buffer.alloc(0)); });
+        ws.on('close', (code) => resolve(code));
+        setTimeout(() => resolve('no close'), 3000);
+        ws.on('error', () => {});
+    });
+    assert.strictEqual(r6, 1011);
+
     console.log = log;
     console.log('SELFTEST OK');
     process.exit(0);
