@@ -60,6 +60,9 @@ function loadConfig() {
     config.listenPort = Number(config.listenPort) || 8765;
     config.pathPrefix = String(config.pathPrefix || '/pve-console-ws').replace(/\/+$/, '');
     config.maxSessionSeconds = Number(config.maxSessionSeconds) || 7200;
+    // WebSocket ping on both legs: a static VNC screen sends nothing, and the
+    // reverse proxies' read timeouts would otherwise drop an idle console.
+    config.pingIntervalSeconds = Number(config.pingIntervalSeconds) || 30;
     // Largest single WebSocket message and per-direction buffer, in bytes.
     config.maxPayloadBytes = Number(config.maxPayloadBytes) || 1024 * 1024;
     config.acceptLegacyV1 = config.acceptLegacyV1 === true;
@@ -294,6 +297,7 @@ function createRelay(config) {
         session.fromUpstreamBytes = 0;
         clearTimeout(session.sessionTimer);
         clearTimeout(session.attachTimer);
+        clearInterval(session.pingTimer);
         try { if (session.clientWs) session.clientWs.close(clientCode, reason); } catch (e) { /* already closed */ }
         try { if (session.upstream) session.upstream.close(); } catch (e) { /* already closed */ }
     };
@@ -411,6 +415,14 @@ function createRelay(config) {
             closeSession(session, 4408, 'session timeout');
         }, Math.max(1000, config.maxSessionSeconds * 1000));
         session.sessionTimer.unref();
+        session.pingTimer = setInterval(() => {
+            for (const ws of [session.clientWs, session.upstream]) {
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    try { ws.ping(); } catch (e) { /* closing */ }
+                }
+            }
+        }, config.pingIntervalSeconds * 1000);
+        session.pingTimer.unref();
         // A prewarmed upstream whose browser never attaches is released
         // when the token expires.
         session.attachTimer = setTimeout(() => {

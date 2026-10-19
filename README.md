@@ -71,7 +71,8 @@ chown root:pverelay config.json && chmod 640 config.json   # the secret must not
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `maxSessionSeconds` | 7200 (example: 1800) | hard limit of an attached console session |
+| `maxSessionSeconds` | 7200 (example: 14400) | hard limit of an attached console session; closed with code 4408 |
+| `pingIntervalSeconds` | 30 | WebSocket ping to the browser and to Proxmox, so idle consoles survive reverse-proxy read timeouts |
 | `maxPayloadBytes` | 1048576 | largest WebSocket message; also the byte cap of each queue held before the viewer/upstream connects (plus at most 1024 messages per queue). Once both sides are connected, a side whose unsent data passes 4 × this value is too slow and the session is closed (backpressure) |
 | `upstreamCaFile` | — | PEM of the CA that signed the Proxmox certificates (e.g. the cluster's `/etc/pve/pve-root-ca.pem`); without it the system CAs are used |
 | `allowInsecureUpstream` | `false` | TLS to Proxmox is **always verified**; only `true` lets a token minted with TLS verification off (WHMCS server "Secure" unticked) skip it |
@@ -207,7 +208,7 @@ Adjust the port in any of the above to match `listenPort` in `config.json`.
   install valid certificates) before upgrading, or set
   `allowInsecureUpstream: true` as a temporary, explicit opt-out.
 - A suspended WHMCS service keeps an already open console until it closes or
-  `maxSessionSeconds` elapses; keep that value short (the example uses 1800).
+  `maxSessionSeconds` elapses (the example uses 4 h).
 - Keep `listenPort` bound to `127.0.0.1` (already the default) so it is only
   reachable through the reverse proxy, never directly from the Internet.
 
