@@ -2,5 +2,9 @@
   "secret": "PASTE_THE_SAME_VALUE_AS_WHMCS_MODULE_CONFIG_CONSOLE_RELAY_SECRET",
   "listenPort": 8765,
   "pathPrefix": "/pve-console-ws",
-  "maxSessionSeconds": 7200
+  "maxSessionSeconds": 1800,
+  "maxPayloadBytes": 1048576,
+  "upstreamCaFile": "",
+  "allowInsecureUpstream": false,
+  "acceptLegacyV1": false
 }

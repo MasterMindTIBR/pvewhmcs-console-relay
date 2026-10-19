@@ -60,6 +60,13 @@ function loadConfig() {
     config.listenPort = Number(config.listenPort) || 8765;
     config.pathPrefix = String(config.pathPrefix || '/pve-console-ws').replace(/\/+$/, '');
     config.maxSessionSeconds = Number(config.maxSessionSeconds) || 7200;
+    // Largest single WebSocket message and per-direction buffer, in bytes.
+    config.maxPayloadBytes = Number(config.maxPayloadBytes) || 1024 * 1024;
+    config.acceptLegacyV1 = config.acceptLegacyV1 === true;
+    // TLS to Proxmox is always verified unless the operator opts out here;
+    // the token's "verify" flag can only relax it when this is true.
+    config.allowInsecureUpstream = config.allowInsecureUpstream === true;
+    config.upstreamCa = config.upstreamCaFile ? fs.readFileSync(config.upstreamCaFile) : undefined;
 
     return config;
 }
@@ -114,8 +121,8 @@ function decodeTokenV2(token, secret) {
 
 /**
  * v1 (legacy, readable by the browser): base64url(json) + "." + hex HMAC-SHA256.
- * Still accepted so a relay upgrade never breaks consoles minted by an
- * older WHMCS module.
+ * Refused unless config.json sets "acceptLegacyV1": true (only for WHMCS
+ * modules older than the v2 tokens).
  */
 function decodeTokenV1(token, secret) {
     if (token.indexOf('.') === -1) {
@@ -141,9 +148,12 @@ function decodeTokenV1(token, secret) {
  * protection happens in the caller, which tracks the "sid" once the
  * token is confirmed authentic.
  */
-function verifyToken(token, secret) {
+function verifyToken(token, secret, acceptLegacyV1 = false) {
     if (typeof token !== 'string' || token === '') {
         throw new Error('malformed token');
+    }
+    if (!token.startsWith(TOKEN_V2_PREFIX) && !acceptLegacyV1) {
+        throw new Error('legacy v1 token refused');
     }
 
     const payload = token.startsWith(TOKEN_V2_PREFIX)
@@ -214,7 +224,7 @@ function createRelay(config) {
 
             let payload;
             try {
-                payload = verifyToken(token, config.secret);
+                payload = verifyToken(token, config.secret, config.acceptLegacyV1);
             } catch (err) {
                 log('reject', { reason: err.message });
                 res.writeHead(401, Object.assign({}, prepareHeaders, { 'Content-Type': 'application/json' }));
@@ -254,9 +264,21 @@ function createRelay(config) {
         res.end('Not found');
     });
 
-    const wss = new WebSocket.Server({ noServer: true });
+    const wss = new WebSocket.Server({ noServer: true, maxPayload: config.maxPayloadBytes });
     const sessions = createSessionRegistry();
-    const maxBufferedBytes = 1024 * 1024;
+    const maxBufferedBytes = config.maxPayloadBytes;
+
+    // Forward one message, or close the session when the receiver lags
+    // (bufferedAmount) so a slow or hostile peer cannot grow memory.
+    const forward = (session, target, data, direction) => {
+        if (target.bufferedAmount + data.length > maxBufferedBytes * 4) {
+            log('backpressure-close', { sid: session.payload.sid, direction });
+            closeSession(session, 1011, 'backpressure');
+
+            return;
+        }
+        target.send(data);
+    };
 
     const closeSession = (session, clientCode, reason) => {
         if (session.closed) {
@@ -278,7 +300,9 @@ function createRelay(config) {
                 Cookie: 'PVEAuthCookie=' + payload.cookie,
                 Origin: upstreamOrigin,
             },
-            rejectUnauthorized: payload.verify !== false,
+            rejectUnauthorized: !(config.allowInsecureUpstream && payload.verify === false),
+            ca: config.upstreamCa,
+            maxPayload: config.maxPayloadBytes,
             handshakeTimeout: 10000,
         });
         session.upstream = upstream;
@@ -288,6 +312,7 @@ function createRelay(config) {
             for (const buffered of session.toUpstream.splice(0)) {
                 upstream.send(buffered);
             }
+            session.toUpstreamBytes = 0;
             log('connected', {
                 sid: payload.sid,
                 host: payload.host,
@@ -297,7 +322,7 @@ function createRelay(config) {
 
         upstream.on('message', (data) => {
             if (session.clientWs && session.clientWs.readyState === WebSocket.OPEN) {
-                session.clientWs.send(data);
+                forward(session, session.clientWs, data, 'to-viewer');
 
                 return;
             }
@@ -364,6 +389,7 @@ function createRelay(config) {
             upstreamOpen: false,
             readyPromise: null,
             toUpstream: [],
+            toUpstreamBytes: 0,
             fromUpstream: [],
             fromUpstreamBytes: 0,
             // Session lifetime, independent of the token's short attach
@@ -411,7 +437,7 @@ function createRelay(config) {
         const token = req.url.split('?')[0].slice(config.pathPrefix.length + 1);
         let payload;
         try {
-            payload = verifyToken(token, config.secret);
+            payload = verifyToken(token, config.secret, config.acceptLegacyV1);
         } catch (err) {
             log('reject', { reason: err.message });
             clientWs.close(4401, 'unauthorized');
@@ -440,10 +466,18 @@ function createRelay(config) {
 
         clientWs.on('message', (data) => {
             if (session.upstreamOpen) {
-                session.upstream.send(data);
-            } else {
-                session.toUpstream.push(data);
+                forward(session, session.upstream, data, 'to-upstream');
+
+                return;
             }
+            if (session.toUpstreamBytes + data.length > maxBufferedBytes) {
+                log('upstream-buffer-overflow', { sid: payload.sid });
+                closeSession(session, 1011, 'upstream buffer overflow');
+
+                return;
+            }
+            session.toUpstream.push(data);
+            session.toUpstreamBytes += data.length;
         });
         clientWs.on('close', () => closeSession(session, 1000, 'viewer closed'));
         clientWs.on('error', () => closeSession(session, 1011, 'viewer error'));
