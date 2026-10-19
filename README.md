@@ -72,7 +72,7 @@ chown root:pverelay config.json && chmod 640 config.json   # the secret must not
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `maxSessionSeconds` | 7200 (example: 1800) | hard limit of an attached console session |
-| `maxPayloadBytes` | 1048576 | largest WebSocket message and per-direction buffer; above it the session is closed |
+| `maxPayloadBytes` | 1048576 | largest WebSocket message; also the byte cap of each queue held before the viewer/upstream connects (plus at most 1024 messages per queue). Once both sides are connected, a side whose unsent data passes 4 × this value is too slow and the session is closed (backpressure) |
 | `upstreamCaFile` | — | PEM of the CA that signed the Proxmox certificates (e.g. the cluster's `/etc/pve/pve-root-ca.pem`); without it the system CAs are used |
 | `allowInsecureUpstream` | `false` | TLS to Proxmox is **always verified**; only `true` lets a token minted with TLS verification off (WHMCS server "Secure" unticked) skip it |
 | `acceptLegacyV1` | `false` | accept the legacy v1 tokens of WHMCS modules older than v1.3.6 (readable by the browser) |

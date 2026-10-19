@@ -267,6 +267,8 @@ function createRelay(config) {
     const wss = new WebSocket.Server({ noServer: true, maxPayload: config.maxPayloadBytes });
     const sessions = createSessionRegistry();
     const maxBufferedBytes = config.maxPayloadBytes;
+    // Entry cap too: zero-length frames add no bytes but still cost memory.
+    const maxQueuedMessages = 1024;
 
     // Forward one message, or close the session when the receiver lags
     // (bufferedAmount) so a slow or hostile peer cannot grow memory.
@@ -285,6 +287,11 @@ function createRelay(config) {
             return;
         }
         session.closed = true;
+        // Only the sid marker is kept (anti-replay); drop buffered data now.
+        session.toUpstream = [];
+        session.fromUpstream = [];
+        session.toUpstreamBytes = 0;
+        session.fromUpstreamBytes = 0;
         clearTimeout(session.sessionTimer);
         clearTimeout(session.attachTimer);
         try { if (session.clientWs) session.clientWs.close(clientCode, reason); } catch (e) { /* already closed */ }
@@ -328,7 +335,7 @@ function createRelay(config) {
             }
 
             const buffered = Buffer.from(data);
-            if (session.fromUpstreamBytes + buffered.length > maxBufferedBytes) {
+            if (session.fromUpstreamBytes + buffered.length > maxBufferedBytes || session.fromUpstream.length >= maxQueuedMessages) {
                 log('handoff-buffer-overflow', { sid: payload.sid });
                 closeSession(session, 1011, 'handoff buffer overflow');
 
@@ -470,7 +477,7 @@ function createRelay(config) {
 
                 return;
             }
-            if (session.toUpstreamBytes + data.length > maxBufferedBytes) {
+            if (session.toUpstreamBytes + data.length > maxBufferedBytes || session.toUpstream.length >= maxQueuedMessages) {
                 log('upstream-buffer-overflow', { sid: payload.sid });
                 closeSession(session, 1011, 'upstream buffer overflow');
 
