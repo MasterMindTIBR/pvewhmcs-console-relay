@@ -67,7 +67,7 @@ function viewer(relayPort, token, send) {
     up.on('upgrade', (req, sock, head) => setTimeout(() => upWss.handleUpgrade(req, sock, head, (ws) => ws.send('hello')), upstreamDelay));
     const upPort = await listen(up);
 
-    const base = { secret: SECRET, pathPrefix: '/pve-console-ws', maxSessionSeconds: 60, maxPayloadBytes: 65536, acceptLegacyV1: false, allowInsecureUpstream: false };
+    const base = { secret: SECRET, pathPrefix: '/pve-console-ws', maxSessionSeconds: 60, pingIntervalSeconds: 1, maxPayloadBytes: 65536, acceptLegacyV1: false, allowInsecureUpstream: false };
     const withCa = createRelay(Object.assign({}, base, { upstreamCa: fs.readFileSync(path.join(dir, 'ca.pem')) }));
     const noCa = createRelay(base);
     const pCa = await listen(withCa);
@@ -111,6 +111,16 @@ function viewer(relayPort, token, send) {
         ws.on('error', () => {});
     });
     assert.strictEqual(r6, 1011);
+
+    // 7. An attached viewer gets WebSocket pings (idle consoles survive proxy read timeouts).
+    upstreamDelay = 0;
+    const r7 = await new Promise((resolve) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${pCa}/pve-console-ws/${tokenV2(payload())}`);
+        ws.on('ping', () => { ws.close(1000); resolve('ping'); });
+        setTimeout(() => resolve('no ping'), 3000);
+        ws.on('error', () => {});
+    });
+    assert.strictEqual(r7, 'ping');
 
     console.log = log;
     console.log('SELFTEST OK');
