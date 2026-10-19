@@ -5,10 +5,11 @@
   "private": true,
   "main": "server.js",
   "engines": {
-    "node": ">=16"
+    "node": ">=22"
   },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node test/selftest.js"
   },
   "dependencies": {
     "ws": "^8.18.0"

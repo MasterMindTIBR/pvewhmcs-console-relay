@@ -54,14 +54,28 @@ to keep sharing the WHMCS domain instead.
 
 ## 1. Deploy the relay
 
+Needs a supported Node.js LTS (22 or later).
+
 ```bash
+useradd --system --home /nonexistent --shell /usr/sbin/nologin pverelay
 git clone https://github.com/MasterMindTIBR/pvewhmcs-console-relay.git /opt/pvewhmcs-console-relay
 cd /opt/pvewhmcs-console-relay
+npm ci --omit=dev
 cp config.example.json config.json
 # edit config.json: set "secret" to the same value as WHMCS's Module Config
 # "Console Relay Secret" (generate one with: openssl rand -hex 32)
-npm install --omit=dev
+chown root:pverelay config.json && chmod 640 config.json   # the secret must not be world-readable
 ```
+
+`config.json` options besides `secret`, `listenPort`, `pathPrefix`:
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `maxSessionSeconds` | 7200 (example: 1800) | hard limit of an attached console session |
+| `maxPayloadBytes` | 1048576 | largest WebSocket message; also the byte cap of each queue held before the viewer/upstream connects (plus at most 1024 messages per queue). Once both sides are connected, a side whose unsent data passes 4 × this value is too slow and the session is closed (backpressure) |
+| `upstreamCaFile` | — | PEM of the CA that signed the Proxmox certificates (e.g. the cluster's `/etc/pve/pve-root-ca.pem`); without it the system CAs are used |
+| `allowInsecureUpstream` | `false` | TLS to Proxmox is **always verified**; only `true` lets a token minted with TLS verification off (WHMCS server "Secure" unticked) skip it |
+| `acceptLegacyV1` | `false` | accept the legacy v1 tokens of WHMCS modules older than v1.3.6 (readable by the browser) |
 
 Create `/etc/systemd/system/pvewhmcs-console-relay.service`:
 
@@ -75,7 +89,18 @@ Type=simple
 WorkingDirectory=/opt/pvewhmcs-console-relay
 ExecStart=/usr/bin/node server.js
 Restart=on-failure
-User=<a dedicated non-root system user>
+User=pverelay
+Group=pverelay
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+MemoryMax=256M
 
 [Install]
 WantedBy=multi-user.target
@@ -177,6 +202,12 @@ Adjust the port in any of the above to match `listenPort` in `config.json`.
   session that no browser attaches to in that window is closed. Once a viewer
   is attached, the session lasts until either side closes or
   `maxSessionSeconds` (default 7200) elapses. Each token's `sid` works once.
+- **Upgrading from earlier versions:** TLS to Proxmox is now always verified
+  and v1 tokens are refused. Point `upstreamCaFile` at the Proxmox CA (or
+  install valid certificates) before upgrading, or set
+  `allowInsecureUpstream: true` as a temporary, explicit opt-out.
+- A suspended WHMCS service keeps an already open console until it closes or
+  `maxSessionSeconds` elapses; keep that value short (the example uses 1800).
 - Keep `listenPort` bound to `127.0.0.1` (already the default) so it is only
   reachable through the reverse proxy, never directly from the Internet.
 
