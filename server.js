@@ -60,14 +60,11 @@ function loadConfig() {
     config.listenPort = Number(config.listenPort) || 8765;
     config.pathPrefix = String(config.pathPrefix || '/pve-console-ws').replace(/\/+$/, '');
     config.maxSessionSeconds = Number(config.maxSessionSeconds) || 7200;
-    // WebSocket ping on both legs: a static VNC screen sends nothing, and the
-    // reverse proxies' read timeouts would otherwise drop an idle console.
+    // A static VNC screen sends nothing; pings keep proxy read timeouts from dropping idle consoles.
     config.pingIntervalSeconds = Number(config.pingIntervalSeconds) || 30;
-    // Largest single WebSocket message and per-direction buffer, in bytes.
     config.maxPayloadBytes = Number(config.maxPayloadBytes) || 1024 * 1024;
     config.acceptLegacyV1 = config.acceptLegacyV1 === true;
-    // TLS to Proxmox is always verified unless the operator opts out here;
-    // the token's "verify" flag can only relax it when this is true.
+    // The token's verify:false relaxes upstream TLS only when the operator sets this.
     config.allowInsecureUpstream = config.allowInsecureUpstream === true;
     config.upstreamCa = config.upstreamCaFile ? fs.readFileSync(config.upstreamCaFile) : undefined;
 
@@ -124,8 +121,7 @@ function decodeTokenV2(token, secret) {
 
 /**
  * v1 (legacy, readable by the browser): base64url(json) + "." + hex HMAC-SHA256.
- * Refused unless config.json sets "acceptLegacyV1": true (only for WHMCS
- * modules older than the v2 tokens).
+ * Refused unless config.json sets "acceptLegacyV1": true.
  */
 function decodeTokenV1(token, secret) {
     if (token.indexOf('.') === -1) {
@@ -273,8 +269,7 @@ function createRelay(config) {
     // Entry cap too: zero-length frames add no bytes but still cost memory.
     const maxQueuedMessages = 1024;
 
-    // Forward one message, or close the session when the receiver lags
-    // (bufferedAmount) so a slow or hostile peer cannot grow memory.
+    // Close instead of buffering when the receiver lags, so a slow peer cannot grow memory.
     const forward = (session, target, data, direction) => {
         if (target.bufferedAmount + data.length > maxBufferedBytes * 4) {
             log('backpressure-close', { sid: session.payload.sid, direction });
