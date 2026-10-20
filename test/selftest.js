@@ -46,7 +46,6 @@ function listen(server) {
     return new Promise((r) => server.listen(0, '127.0.0.1', () => r(server.address().port)));
 }
 
-// Connects a viewer and resolves with how the session ended.
 function viewer(relayPort, token, send) {
     return new Promise((resolve) => {
         const ws = new WebSocket(`ws://127.0.0.1:${relayPort}/pve-console-ws/${token}`);
