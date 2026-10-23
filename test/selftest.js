@@ -5,7 +5,9 @@ const assert = require('assert');
 const crypto = require('crypto');
 const { execFileSync } = require('child_process');
 const fs = require('fs');
+const http = require('http');
 const https = require('https');
+const net = require('net');
 const os = require('os');
 const path = require('path');
 const WebSocket = require('ws');
@@ -46,14 +48,23 @@ function listen(server) {
     return new Promise((r) => server.listen(0, '127.0.0.1', () => r(server.address().port)));
 }
 
-function viewer(relayPort, token, send) {
+// Resolves with the close code, or the HTTP status when the upgrade is refused.
+function viewer(relayPort, token, send, opts) {
     return new Promise((resolve) => {
-        const ws = new WebSocket(`ws://127.0.0.1:${relayPort}/pve-console-ws/${token}`);
+        const ws = new WebSocket(`ws://127.0.0.1:${relayPort}/pve-console-ws/${token}`, opts);
         let got = '';
         ws.on('open', () => { if (send) ws.send(send); });
         ws.on('message', (d) => { got += d.toString(); if (got === 'hello') ws.close(1000); });
         ws.on('close', (code) => resolve({ code, got }));
+        ws.on('unexpected-response', (_req, res) => resolve({ http: res.statusCode, got }));
         ws.on('error', () => {});
+    });
+}
+
+function prepare(relayPort, token) {
+    return new Promise((resolve) => {
+        const req = http.request({ host: '127.0.0.1', port: relayPort, method: 'POST', path: `/pve-console-ws/${token}/prepare` }, (res) => { res.resume(); resolve(res.statusCode); });
+        req.end();
     });
 }
 
@@ -63,7 +74,14 @@ function viewer(relayPort, token, send) {
     let upstreamDelay = 0;
     const up = https.createServer({ key: fs.readFileSync(path.join(dir, 'srv.key')), cert: fs.readFileSync(path.join(dir, 'srv.pem')) });
     const upWss = new WebSocket.Server({ noServer: true });
-    up.on('upgrade', (req, sock, head) => setTimeout(() => upWss.handleUpgrade(req, sock, head, (ws) => ws.send('hello')), upstreamDelay));
+    up.on('upgrade', (req, sock, head) => {
+        if (req.url.startsWith('/deny')) {
+            sock.end('HTTP/1.1 401 No ticket\r\nContent-Length: 0\r\n\r\n');
+
+            return;
+        }
+        setTimeout(() => upWss.handleUpgrade(req, sock, head, (ws) => ws.send('hello')), upstreamDelay);
+    });
     const upPort = await listen(up);
 
     const base = { secret: SECRET, pathPrefix: '/pve-console-ws', maxSessionSeconds: 60, pingIntervalSeconds: 1, maxPayloadBytes: 65536, acceptLegacyV1: false, allowInsecureUpstream: false };
@@ -77,7 +95,7 @@ function viewer(relayPort, token, send) {
     // 1. v1 refused by default, accepted only when opted in.
     assert.throws(() => verifyToken(tokenV1(payload()), SECRET), /legacy v1/);
     assert.ok(verifyToken(tokenV1(payload()), SECRET, true).sid);
-    assert.strictEqual((await viewer(pCa, tokenV1(payload()))).code, 4401);
+    assert.strictEqual((await viewer(pCa, tokenV1(payload()))).http, 401);
 
     // 2. v2 + trusted CA: data flows.
     assert.strictEqual((await viewer(pCa, tokenV2(payload()))).got, 'hello');
@@ -120,6 +138,65 @@ function viewer(relayPort, token, send) {
         ws.on('error', () => {});
     });
     assert.strictEqual(r7, 'ping');
+
+    // 8. Garbage frames after a refused upgrade do not crash the process; another session keeps working.
+    const held = new WebSocket(`ws://127.0.0.1:${pCa}/pve-console-ws/${tokenV2(payload())}`);
+    held.on('error', () => {});
+    await new Promise((r) => held.on('message', r));
+    const refused = await new Promise((resolve) => {
+        const s = net.connect(pCa, '127.0.0.1', () => {
+            s.write('GET /pve-console-ws/v2.bogus HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n');
+            s.write(Buffer.from([0x81, 0x05, 0x68, 0x65, 0x6c, 0x6c, 0x6f]));
+        });
+        let reply = '';
+        s.on('data', (d) => { reply += d; });
+        s.on('close', () => resolve(reply.split('\r\n')[0]));
+        s.on('error', () => resolve(reply.split('\r\n')[0]));
+    });
+    assert.strictEqual(refused, 'HTTP/1.1 401 Unauthorized');
+    assert.strictEqual(held.readyState, WebSocket.OPEN);
+    assert.strictEqual((await viewer(pCa, tokenV2(payload()))).got, 'hello');
+    held.close();
+
+    // 9. Session caps: 429 globally and per host/VM.
+    const capped = createRelay(Object.assign({}, base, { upstreamCa: fs.readFileSync(path.join(dir, 'ca.pem')), maxSessions: 3, maxSessionsPerTarget: 2 }));
+    const pCap = await listen(capped);
+    assert.strictEqual(await prepare(pCap, tokenV2(payload())), 200);
+    assert.strictEqual(await prepare(pCap, tokenV2(payload())), 200);
+    assert.strictEqual(await prepare(pCap, tokenV2(payload())), 429);
+    assert.strictEqual(await prepare(pCap, tokenV2(Object.assign(payload(), { path: 'other' }))), 200);
+    assert.strictEqual((await viewer(pCap, tokenV2(Object.assign(payload(), { path: 'third' })))).http, 429);
+
+    // 10. A PVE HTTP error (401) closes the attached viewer instead of leaving it waiting.
+    upstreamDelay = 0;
+    const t10 = Date.now();
+    const r10 = await viewer(pCa, tokenV2(Object.assign(payload(), { path: 'deny' })));
+    assert.strictEqual(r10.code, 1011);
+    assert.ok(Date.now() - t10 < 3000);
+
+    // 11. A viewer that stops answering pings is terminated within two ping cycles.
+    const r11 = await new Promise((resolve) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${pCa}/pve-console-ws/${tokenV2(payload())}`, { autoPong: false });
+        ws.on('close', (code) => resolve(code));
+        ws.on('error', () => {});
+        setTimeout(() => resolve('still open'), 4000);
+    });
+    assert.strictEqual(r11, 1006);
+
+    // 12. A used token is refused with 409 (tombstone without the PVE cookie).
+    const used = tokenV2(payload());
+    await viewer(pCa, used);
+    assert.strictEqual((await viewer(pCa, used)).http, 409);
+
+    // 13. The session limit closes the console with 4408.
+    const short = createRelay(Object.assign({}, base, { upstreamCa: fs.readFileSync(path.join(dir, 'ca.pem')), maxSessionSeconds: 1 }));
+    const pShort = await listen(short);
+    const r13 = await new Promise((resolve) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${pShort}/pve-console-ws/${tokenV2(payload())}`);
+        ws.on('close', (code) => resolve(code));
+        ws.on('error', () => {});
+    });
+    assert.strictEqual(r13, 4408);
 
     console.log = log;
     console.log('SELFTEST OK');
