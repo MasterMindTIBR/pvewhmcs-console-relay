@@ -59,10 +59,14 @@ function loadConfig() {
     }
     config.listenPort = Number(config.listenPort) || 8765;
     config.pathPrefix = String(config.pathPrefix || '/pve-console-ws').replace(/\/+$/, '');
-    config.maxSessionSeconds = Number(config.maxSessionSeconds) || 7200;
+    config.maxSessionSeconds = Number(config.maxSessionSeconds) || 14400;
     // A static VNC screen sends nothing; pings keep proxy read timeouts from dropping idle consoles.
     config.pingIntervalSeconds = Number(config.pingIntervalSeconds) || 30;
     config.maxPayloadBytes = Number(config.maxPayloadBytes) || 1024 * 1024;
+    config.maxBufferedBytes = Number(config.maxBufferedBytes) || 512 * 1024;
+    // Sized so maxSessions x worst-case buffers stays under the unit's MemoryMax.
+    config.maxSessions = Number(config.maxSessions) || 50;
+    config.maxSessionsPerTarget = Number(config.maxSessionsPerTarget) || 3;
     config.acceptLegacyV1 = config.acceptLegacyV1 === true;
     // The token's verify:false relaxes upstream TLS only when the operator sets this.
     config.allowInsecureUpstream = config.allowInsecureUpstream === true;
@@ -177,9 +181,8 @@ function createSessionRegistry() {
     setInterval(() => {
         const now = Math.floor(Date.now() / 1000);
         for (const [sid, session] of sessions) {
-            // A closed session is kept until its token expires so the same
-            // sid cannot be replayed; after that it is safe to forget.
-            if (session.expiresAt < now || (session.closed && session.payload.exp < now)) {
+            // A closed session stays as a {closed, exp} tombstone until its token expires (anti-replay).
+            if (session.closed ? session.exp < now : session.expiresAt < now) {
                 sessions.delete(sid);
             }
         }
@@ -194,6 +197,9 @@ function createSessionRegistry() {
         },
         delete(sid) {
             sessions.delete(sid);
+        },
+        values() {
+            return sessions.values();
         },
     };
 }
@@ -233,12 +239,12 @@ function createRelay(config) {
             }
 
             req.resume();
-            const session = getOrCreateSession(payload);
-            if (session.closed) {
-                res.writeHead(409, Object.assign({}, prepareHeaders, {
+            const admission = admit(payload);
+            if (admission.status !== 200) {
+                res.writeHead(admission.status, Object.assign({}, prepareHeaders, {
                     'Content-Type': 'application/json',
                 }));
-                res.end(JSON.stringify({ ready: false, error: 'session already used' }));
+                res.end(JSON.stringify({ ready: false, error: admission.error }));
 
                 return;
             }
@@ -266,12 +272,13 @@ function createRelay(config) {
     const wss = new WebSocket.Server({ noServer: true, maxPayload: config.maxPayloadBytes });
     const sessions = createSessionRegistry();
     const maxBufferedBytes = config.maxPayloadBytes;
+    const targetOf = (payload) => payload.host + '|' + String(payload.path).split('?')[0];
     // Entry cap too: zero-length frames add no bytes but still cost memory.
     const maxQueuedMessages = 1024;
 
     // Close instead of buffering when the receiver lags, so a slow peer cannot grow memory.
     const forward = (session, target, data, direction) => {
-        if (target.bufferedAmount + data.length > maxBufferedBytes * 4) {
+        if (target.bufferedAmount > config.maxBufferedBytes) {
             log('backpressure-close', { sid: session.payload.sid, direction });
             closeSession(session, 1011, 'backpressure');
 
@@ -285,7 +292,6 @@ function createRelay(config) {
             return;
         }
         session.closed = true;
-        // Only the sid marker is kept (anti-replay); drop buffered data now.
         session.toUpstream = [];
         session.fromUpstream = [];
         session.toUpstreamBytes = 0;
@@ -295,6 +301,40 @@ function createRelay(config) {
         clearInterval(session.pingTimer);
         try { if (session.clientWs) session.clientWs.close(clientCode, reason); } catch (e) { /* already closed */ }
         try { if (session.upstream) session.upstream.close(); } catch (e) { /* already closed */ }
+        // Handlers still reference the payload, so drop the PVE cookie from it; the registry keeps only a tombstone.
+        delete session.payload.cookie;
+        sessions.set(session.payload.sid, { closed: true, exp: session.payload.exp });
+    };
+
+    // HTTP status for a token that verified: 409 used/attached, 429 over a session cap.
+    const admit = (payload, attaching = false) => {
+        const existing = sessions.get(payload.sid);
+        if (existing) {
+            if (existing.closed) {
+                return { status: 409, error: 'session already used' };
+            }
+            if (attaching && existing.clientWs) {
+                return { status: 409, error: 'console already attached' };
+            }
+
+            return { status: 200, session: existing };
+        }
+        let total = 0;
+        let sameTarget = 0;
+        const target = targetOf(payload);
+        for (const session of sessions.values()) {
+            if (!session.closed) {
+                total++;
+                if (targetOf(session.payload) === target) sameTarget++;
+            }
+        }
+        if (total >= config.maxSessions || sameTarget >= config.maxSessionsPerTarget) {
+            log('session-cap', { sid: payload.sid, host: payload.host, total, sameTarget });
+
+            return { status: 429, error: 'too many console sessions' };
+        }
+
+        return { status: 200, session: getOrCreateSession(payload) };
     };
 
     const createUpstream = (session) => new Promise((resolve, reject) => {
@@ -327,6 +367,9 @@ function createRelay(config) {
         });
 
         upstream.on('message', (data) => {
+            if (session.closed) {
+                return;
+            }
             if (session.clientWs && session.clientWs.readyState === WebSocket.OPEN) {
                 forward(session, session.clientWs, data, 'to-viewer');
 
@@ -358,7 +401,8 @@ function createRelay(config) {
             closeSession(session, 1000, 'upstream closed');
         });
 
-        upstream.on('unexpected-response', (_request, response) => {
+        // With this listener ws no longer aborts a non-101 reply itself.
+        upstream.on('unexpected-response', (request, response) => {
             log('upstream-http-error', {
                 sid: payload.sid,
                 host: payload.host,
@@ -366,6 +410,10 @@ function createRelay(config) {
                 statusCode: response.statusCode,
                 statusMessage: response.statusMessage,
             });
+            request.destroy();
+            response.destroy();
+            reject(new Error('upstream http ' + response.statusCode));
+            closeSession(session, 1011, 'upstream http ' + response.statusCode);
         });
 
         upstream.on('error', (err) => {
@@ -410,11 +458,25 @@ function createRelay(config) {
             closeSession(session, 4408, 'session timeout');
         }, Math.max(1000, config.maxSessionSeconds * 1000));
         session.sessionTimer.unref();
+        // A peer that has not answered the previous ping by the next one is gone (no FIN/RST).
+        const unanswered = new WeakSet();
         session.pingTimer = setInterval(() => {
             for (const ws of [session.clientWs, session.upstream]) {
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    try { ws.ping(); } catch (e) { /* closing */ }
+                if (!ws || ws.readyState !== WebSocket.OPEN) {
+                    continue;
                 }
+                if (unanswered.has(ws)) {
+                    log('ping-timeout', { sid: payload.sid, side: ws === session.upstream ? 'upstream' : 'viewer' });
+                    ws.terminate();
+                    closeSession(session, 1011, 'ping timeout');
+
+                    return;
+                }
+                if (!ws.listenerCount('pong')) {
+                    ws.on('pong', () => unanswered.delete(ws));
+                }
+                unanswered.add(ws);
+                try { ws.ping(); } catch (e) { /* closing */ }
             }
         }, config.pingIntervalSeconds * 1000);
         session.pingTimer.unref();
@@ -434,7 +496,14 @@ function createRelay(config) {
         return session;
     };
 
+    const rejectUpgrade = (socket, status, text) => {
+        socket.end(`HTTP/1.1 ${status} ${text}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+        socket.destroy();
+    };
+
+    // Token and admission are checked before the WebSocket exists, so a rejected client never reaches the frame parser.
     httpServer.on('upgrade', (req, socket, head) => {
+        socket.on('error', () => socket.destroy());
         const requestPath = (req.url || '').split('?')[0];
         const prefix = config.pathPrefix + '/';
         if (requestPath.endsWith('/prepare') || requestPath.indexOf(prefix) !== 0) {
@@ -442,30 +511,31 @@ function createRelay(config) {
 
             return;
         }
+        let payload;
+        try {
+            payload = verifyToken(requestPath.slice(prefix.length), config.secret, config.acceptLegacyV1);
+        } catch (err) {
+            log('reject', { reason: err.message });
+            rejectUpgrade(socket, 401, 'Unauthorized');
+
+            return;
+        }
+        const admission = admit(payload, true);
+        if (admission.status !== 200) {
+            log('reject', { sid: payload.sid, reason: admission.error });
+            rejectUpgrade(socket, admission.status, admission.status === 429 ? 'Too Many Requests' : 'Conflict');
+
+            return;
+        }
         wss.handleUpgrade(req, socket, head, (ws) => {
-            wss.emit('connection', ws, req);
+            ws.on('error', () => {});
+            attachViewer(admission.session, ws, payload);
         });
     });
 
-    wss.on('connection', (clientWs, req) => {
-        const token = req.url.split('?')[0].slice(config.pathPrefix.length + 1);
-        let payload;
-        try {
-            payload = verifyToken(token, config.secret, config.acceptLegacyV1);
-        } catch (err) {
-            log('reject', { reason: err.message });
-            clientWs.close(4401, 'unauthorized');
-
-            return;
-        }
-
-        const session = getOrCreateSession(payload);
-        if (session.closed) {
-            clientWs.close(4401, 'token already used');
-
-            return;
-        }
-        if (session.clientWs) {
+    const attachViewer = (session, clientWs, payload) => {
+        // Re-checked: another upgrade for the same sid may have won while this handshake ran.
+        if (session.closed || session.clientWs) {
             clientWs.close(4409, 'console already attached');
 
             return;
@@ -479,6 +549,9 @@ function createRelay(config) {
         log('viewer-connected', { sid: payload.sid, host: payload.host });
 
         clientWs.on('message', (data) => {
+            if (session.closed) {
+                return;
+            }
             if (session.upstreamOpen) {
                 forward(session, session.upstream, data, 'to-upstream');
 
@@ -495,7 +568,7 @@ function createRelay(config) {
         });
         clientWs.on('close', () => closeSession(session, 1000, 'viewer closed'));
         clientWs.on('error', () => closeSession(session, 1011, 'viewer error'));
-    });
+    };
 
     return httpServer;
 }
