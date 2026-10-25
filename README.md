@@ -75,8 +75,9 @@ chown root:pverelay config.json && chmod 640 config.json   # the secret must not
 | `pingIntervalSeconds` | 30 | WebSocket ping to the browser and to Proxmox, so idle consoles survive reverse-proxy read timeouts. A side that has not answered by the next ping is dropped and the session closed |
 | `maxPayloadBytes` | 1048576 | largest WebSocket message; also the byte cap of each queue held before the viewer/upstream connects (plus at most 1024 messages per queue) |
 | `maxBufferedBytes` | 524288 | once both sides are connected, a side with more unsent data than this is too slow and the session is closed (backpressure) |
-| `maxSessions` | 50 | open sessions (prewarmed or attached) in this process; over it, `/prepare` and the WebSocket upgrade answer HTTP 429. Size it with `MemoryMax`: each session can hold about 2 × (`maxBufferedBytes` + `maxPayloadBytes`) |
+| `maxSessions` | 50 | open sessions (prewarmed, attached, or closed with a socket still closing) in this process; over it, `/prepare` and the WebSocket upgrade answer HTTP 429. Size it with `MemoryMax`: each session can hold about 2 × (`maxBufferedBytes` + `maxPayloadBytes`) |
 | `maxSessionsPerTarget` | 3 | open sessions for the same Proxmox host and console path (one VM); HTTP 429 over it |
+| `closeGraceSeconds` | 5 | how long a closing socket may wait for the peer's close frame before the relay drops it. Until then the session still counts against both caps |
 | `upstreamCaFile` | — | PEM of the CA that signed the Proxmox certificates (e.g. the cluster's `/etc/pve/pve-root-ca.pem`); without it the system CAs are used |
 | `allowInsecureUpstream` | `false` | TLS to Proxmox is **always verified**; only `true` lets a token minted with TLS verification off (WHMCS server "Secure" unticked) skip it |
 | `acceptLegacyV1` | `false` | accept the legacy v1 tokens of WHMCS modules older than v1.3.6 (readable by the browser) |

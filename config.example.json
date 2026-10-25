@@ -7,6 +7,7 @@
   "maxBufferedBytes": 524288,
   "maxSessions": 50,
   "maxSessionsPerTarget": 3,
+  "closeGraceSeconds": 5,
   "pingIntervalSeconds": 30,
   "upstreamCaFile": "",
   "allowInsecureUpstream": false,
