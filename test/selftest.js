@@ -74,9 +74,17 @@ function prepare(relayPort, token) {
     let upstreamDelay = 0;
     const up = https.createServer({ key: fs.readFileSync(path.join(dir, 'srv.key')), cert: fs.readFileSync(path.join(dir, 'srv.pem')) });
     const upWss = new WebSocket.Server({ noServer: true });
+    const upNoPong = new WebSocket.Server({ noServer: true, autoPong: false });
+    const httpErrors = { '/deny': '401 No ticket', '/forbidden': '403 Permission check failed', '/broken': '500 Internal Server Error' };
     up.on('upgrade', (req, sock, head) => {
-        if (req.url.startsWith('/deny')) {
-            sock.end('HTTP/1.1 401 No ticket\r\nContent-Length: 0\r\n\r\n');
+        const status = httpErrors[req.url.split('?')[0]];
+        if (status) {
+            sock.end(`HTTP/1.1 ${status}\r\nContent-Length: 0\r\n\r\n`);
+
+            return;
+        }
+        if (req.url.startsWith('/nopong')) {
+            upNoPong.handleUpgrade(req, sock, head, (ws) => ws.send('hello'));
 
             return;
         }
@@ -84,7 +92,7 @@ function prepare(relayPort, token) {
     });
     const upPort = await listen(up);
 
-    const base = { secret: SECRET, pathPrefix: '/pve-console-ws', maxSessionSeconds: 60, pingIntervalSeconds: 1, maxPayloadBytes: 65536, acceptLegacyV1: false, allowInsecureUpstream: false };
+    const base = { secret: SECRET, pathPrefix: '/pve-console-ws', maxSessionSeconds: 60, pingIntervalSeconds: 1, maxPayloadBytes: 65536, closeGraceSeconds: 5, acceptLegacyV1: false, allowInsecureUpstream: false };
     const withCa = createRelay(Object.assign({}, base, { upstreamCa: fs.readFileSync(path.join(dir, 'ca.pem')) }));
     const noCa = createRelay(base);
     const pCa = await listen(withCa);
@@ -166,6 +174,11 @@ function prepare(relayPort, token) {
     assert.strictEqual(await prepare(pCap, tokenV2(payload())), 429);
     assert.strictEqual(await prepare(pCap, tokenV2(Object.assign(payload(), { path: 'other' }))), 200);
     assert.strictEqual((await viewer(pCap, tokenV2(Object.assign(payload(), { path: 'third' })))).http, 429);
+    assert.strictEqual(await prepare(pCap, tokenV2(Object.assign(payload(), { path: 'fourth' }))), 429);
+    const perTarget = createRelay(Object.assign({}, base, { upstreamCa: fs.readFileSync(path.join(dir, 'ca.pem')), maxSessionsPerTarget: 1 }));
+    const pPer = await listen(perTarget);
+    assert.strictEqual(await prepare(pPer, tokenV2(payload())), 200);
+    assert.strictEqual((await viewer(pPer, tokenV2(payload()))).http, 429);
 
     // 10. A PVE HTTP error (401) closes the attached viewer instead of leaving it waiting.
     upstreamDelay = 0;
@@ -197,6 +210,40 @@ function prepare(relayPort, token) {
         ws.on('error', () => {});
     });
     assert.strictEqual(r13, 4408);
+
+    // 14. A viewer that ignores the close frame keeps its slot until closeGraceSeconds drops it.
+    const grace = createRelay(Object.assign({}, base, { upstreamCa: fs.readFileSync(path.join(dir, 'ca.pem')), maxSessionSeconds: 1, maxSessions: 1, closeGraceSeconds: 2 }));
+    const pGrace = await listen(grace);
+    const deaf = net.connect(pGrace, '127.0.0.1', () => {
+        deaf.write(`GET /pve-console-ws/${tokenV2(payload())} HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n`);
+    });
+    const deafClosed = new Promise((r) => deaf.on('close', r));
+    await new Promise((r) => deaf.on('data', (d) => { if (d.includes(0x88)) r(); }));
+    const tClose = Date.now();
+    assert.strictEqual(await prepare(pGrace, tokenV2(payload())), 429);
+    await deafClosed;
+    assert.ok(Date.now() - tClose >= 1500);
+    assert.strictEqual(await prepare(pGrace, tokenV2(payload())), 200);
+
+    // 15. PVE 403/500 close an attached viewer; a prewarm that hits one frees its slot and burns the token.
+    assert.strictEqual((await viewer(pCa, tokenV2(Object.assign(payload(), { path: 'forbidden' })))).code, 1011);
+    assert.strictEqual((await viewer(pCa, tokenV2(Object.assign(payload(), { path: 'broken' })))).code, 1011);
+    const one = createRelay(Object.assign({}, base, { upstreamCa: fs.readFileSync(path.join(dir, 'ca.pem')), maxSessionsPerTarget: 1 }));
+    const pOne = await listen(one);
+    const prewarmed = tokenV2(Object.assign(payload(), { path: 'forbidden' }));
+    assert.strictEqual(await prepare(pOne, prewarmed), 200);
+    await new Promise((r) => setTimeout(r, 500));
+    assert.strictEqual((await viewer(pOne, prewarmed)).http, 409);
+    assert.strictEqual(await prepare(pOne, tokenV2(Object.assign(payload(), { path: 'forbidden' }))), 200);
+
+    // 16. An upstream that stops answering pings closes the session within two ping cycles.
+    const r16 = await new Promise((resolve) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${pCa}/pve-console-ws/${tokenV2(Object.assign(payload(), { path: 'nopong' }))}`);
+        ws.on('close', (code, reason) => resolve(code + ' ' + reason));
+        ws.on('error', () => {});
+        setTimeout(() => resolve('still open'), 4000);
+    });
+    assert.strictEqual(r16, '1011 ping timeout');
 
     console.log = log;
     console.log('SELFTEST OK');

@@ -67,6 +67,7 @@ function loadConfig() {
     // Sized so maxSessions x worst-case buffers stays under the unit's MemoryMax.
     config.maxSessions = Number(config.maxSessions) || 50;
     config.maxSessionsPerTarget = Number(config.maxSessionsPerTarget) || 3;
+    config.closeGraceSeconds = Number(config.closeGraceSeconds) || 5;
     config.acceptLegacyV1 = config.acceptLegacyV1 === true;
     // The token's verify:false relaxes upstream TLS only when the operator sets this.
     config.allowInsecureUpstream = config.allowInsecureUpstream === true;
@@ -269,8 +270,10 @@ function createRelay(config) {
         res.end('Not found');
     });
 
-    const wss = new WebSocket.Server({ noServer: true, maxPayload: config.maxPayloadBytes });
+    const wss = new WebSocket.Server({ noServer: true, maxPayload: config.maxPayloadBytes, closeTimeout: config.closeGraceSeconds * 1000 });
     const sessions = createSessionRegistry();
+    // Sockets still closing keep their slot, so a peer that ignores the close cannot exceed the caps.
+    const draining = new Map();
     const maxBufferedBytes = config.maxPayloadBytes;
     const targetOf = (payload) => payload.host + '|' + String(payload.path).split('?')[0];
     // Entry cap too: zero-length frames add no bytes but still cost memory.
@@ -301,6 +304,16 @@ function createRelay(config) {
         clearInterval(session.pingTimer);
         try { if (session.clientWs) session.clientWs.close(clientCode, reason); } catch (e) { /* already closed */ }
         try { if (session.upstream) session.upstream.close(); } catch (e) { /* already closed */ }
+        const open = [session.clientWs, session.upstream].filter((ws) => ws && ws.readyState !== WebSocket.CLOSED);
+        if (open.length) {
+            const slot = { target: targetOf(session.payload), open: open.length };
+            draining.set(session.payload.sid, slot);
+            for (const ws of open) {
+                ws.once('close', () => {
+                    if (--slot.open === 0) draining.delete(session.payload.sid);
+                });
+            }
+        }
         // Handlers still reference the payload, so drop the PVE cookie from it; the registry keeps only a tombstone.
         delete session.payload.cookie;
         sessions.set(session.payload.sid, { closed: true, exp: session.payload.exp });
@@ -319,9 +332,12 @@ function createRelay(config) {
 
             return { status: 200, session: existing };
         }
-        let total = 0;
+        let total = draining.size;
         let sameTarget = 0;
         const target = targetOf(payload);
+        for (const slot of draining.values()) {
+            if (slot.target === target) sameTarget++;
+        }
         for (const session of sessions.values()) {
             if (!session.closed) {
                 total++;
@@ -350,6 +366,7 @@ function createRelay(config) {
             ca: config.upstreamCa,
             maxPayload: config.maxPayloadBytes,
             handshakeTimeout: 10000,
+            closeTimeout: config.closeGraceSeconds * 1000,
         });
         session.upstream = upstream;
 
