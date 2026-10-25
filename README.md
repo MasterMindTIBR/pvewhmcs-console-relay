@@ -71,8 +71,13 @@ chown root:pverelay config.json && chmod 640 config.json   # the secret must not
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `maxSessionSeconds` | 7200 (example: 1800) | hard limit of an attached console session |
-| `maxPayloadBytes` | 1048576 | largest WebSocket message; also the byte cap of each queue held before the viewer/upstream connects (plus at most 1024 messages per queue). Once both sides are connected, a side whose unsent data passes 4 × this value is too slow and the session is closed (backpressure) |
+| `maxSessionSeconds` | 14400 | hard limit of a console session, counted from the prepare; closed with code 4408 |
+| `pingIntervalSeconds` | 30 | WebSocket ping to the browser and to Proxmox, so idle consoles survive reverse-proxy read timeouts. A side that has not answered by the next ping is dropped and the session closed |
+| `maxPayloadBytes` | 1048576 | largest WebSocket message; also the byte cap of each queue held before the viewer/upstream connects (plus at most 1024 messages per queue) |
+| `maxBufferedBytes` | 524288 | once both sides are connected, a side with more unsent data than this is too slow and the session is closed (backpressure) |
+| `maxSessions` | 50 | open sessions (prewarmed, attached, or closed with a socket still closing) in this process; over it, `/prepare` and the WebSocket upgrade answer HTTP 429. Size it with `MemoryMax`: each session can hold about 2 × (`maxBufferedBytes` + `maxPayloadBytes`) |
+| `maxSessionsPerTarget` | 3 | open sessions for the same Proxmox host and console path (one VM); HTTP 429 over it |
+| `closeGraceSeconds` | 5 | how long a closing socket may wait for the peer's close frame before the relay drops it. Until then the session still counts against both caps |
 | `upstreamCaFile` | — | PEM of the CA that signed the Proxmox certificates (e.g. the cluster's `/etc/pve/pve-root-ca.pem`); without it the system CAs are used |
 | `allowInsecureUpstream` | `false` | TLS to Proxmox is **always verified**; only `true` lets a token minted with TLS verification off (WHMCS server "Secure" unticked) skip it |
 | `acceptLegacyV1` | `false` | accept the legacy v1 tokens of WHMCS modules older than v1.3.6 (readable by the browser) |
@@ -175,7 +180,7 @@ Adjust the port in any of the above to match `listenPort` in `config.json`.
    DevTools' Network tab; it must **not** be a direct connection to the
    Proxmox host, and the upgrade response should be `101 Switching
    Protocols`, not a stall.
-3. If it fails immediately with code `4401`, the token was invalid/expired —
+3. If the upgrade fails immediately with HTTP 401, the token was invalid/expired —
    check the relay's log (`journalctl -u pvewhmcs-console-relay`) and
    confirm both secrets match exactly.
 4. If noVNC reports `1011` with reason `upstream error`, the relay reached
@@ -201,13 +206,19 @@ Adjust the port in any of the above to match `listenPort` in `config.json`.
   during its short lifetime (120 s, set by the WHMCS module); a prewarmed
   session that no browser attaches to in that window is closed. Once a viewer
   is attached, the session lasts until either side closes or
-  `maxSessionSeconds` (default 7200) elapses. Each token's `sid` works once.
+  `maxSessionSeconds` (default 14400) elapses. Each token's `sid` works once.
+- The token is checked before the WebSocket upgrade: an invalid or expired
+  token gets HTTP 401, a used token or a second viewer HTTP 409, and a
+  session cap HTTP 429. No WebSocket is opened for a refused request.
+- The token travels in the URL path. Keep it out of every proxy log: no
+  `access_log` for the console location, and an `error_log` level that does
+  not record request lines (`crit`), including on the front reverse proxy.
 - **Upgrading from earlier versions:** TLS to Proxmox is now always verified
   and v1 tokens are refused. Point `upstreamCaFile` at the Proxmox CA (or
   install valid certificates) before upgrading, or set
   `allowInsecureUpstream: true` as a temporary, explicit opt-out.
 - A suspended WHMCS service keeps an already open console until it closes or
-  `maxSessionSeconds` elapses; keep that value short (the example uses 1800).
+  `maxSessionSeconds` elapses (the example uses 4 h).
 - Keep `listenPort` bound to `127.0.0.1` (already the default) so it is only
   reachable through the reverse proxy, never directly from the Internet.
 
